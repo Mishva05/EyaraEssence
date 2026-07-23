@@ -14,7 +14,7 @@ const router = express.Router();
 
 // Public storefront routes
 router.get("/", getProducts);
-router.get("/:slug", getProductBySlug);
+router.get("/:slugOrId", getProductBySlug);
 
 // Admin-only management endpoints
 router.post("/", protect, restrictTo("ADMIN"), createProduct);

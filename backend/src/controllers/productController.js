@@ -9,16 +9,48 @@ const generateSlug = (text) => {
     .replace(/(^-|-$)+/g, "");
 };
 
-// Helper to serialize Prisma Decimal money fields as consistent strings
+// Helper to serialize Prisma Decimal money fields as consistent strings and formats for frontend
 const serializeProduct = (product) => {
   if (!product) return null;
   const serialized = { ...product };
+  
   if (serialized.price) {
     serialized.price = serialized.price.toString();
   }
   if (serialized.compareAtPrice) {
     serialized.compareAtPrice = serialized.compareAtPrice.toString();
   }
+
+  // Calculate rating and review statistics dynamically
+  if (serialized.reviews) {
+    const totalReviews = serialized.reviews.length;
+    let avgRating = null;
+    if (totalReviews > 0) {
+      const sum = serialized.reviews.reduce((acc, r) => acc + r.rating, 0);
+      avgRating = parseFloat((sum / totalReviews).toFixed(1));
+    }
+    serialized.rating = avgRating;
+    serialized.reviewsCount = totalReviews;
+    delete serialized.reviews;
+  } else {
+    serialized.rating = null;
+    serialized.reviewsCount = 0;
+  }
+
+  // Sync aggregate stock, colors, and stockStatus from active variants
+  if (serialized.variants) {
+    const activeVariants = serialized.variants.filter(v => v.isActive);
+    serialized.colors = activeVariants.map(v => v.color);
+    
+    // Calculate total stock from active variants
+    const totalStock = activeVariants.reduce((sum, v) => sum + v.stock, 0);
+    serialized.stock = totalStock;
+    serialized.stockStatus = totalStock === 0 ? "out-of-stock" : totalStock <= 5 ? "low-stock" : "in-stock";
+  } else {
+    serialized.colors = [];
+    serialized.stockStatus = "out-of-stock";
+  }
+
   return serialized;
 };
 
@@ -40,10 +72,9 @@ export const getProducts = async (req, res, next) => {
       limit
     } = req.query;
 
-    // Build public where query (always restrict to isActive = true)
     const where = { isActive: true };
 
-    // 1. Category filter (by slug)
+    // 1. Category filter
     if (category) {
       where.category = { slug: category };
     }
@@ -65,7 +96,7 @@ export const getProducts = async (req, res, next) => {
       }
     }
 
-    // 3. Status filters (featured / bestseller)
+    // 3. Status filters
     if (featured === "true") {
       where.isFeatured = true;
     }
@@ -73,22 +104,34 @@ export const getProducts = async (req, res, next) => {
       where.isBestseller = true;
     }
 
-    // 4. In stock filter
+    // 4. In stock filter (checks if at least one active variant is in stock)
     if (inStock === "true") {
-      where.stock = { gt: 0 };
+      where.variants = {
+        some: {
+          stock: { gt: 0 },
+          isActive: true
+        }
+      };
     }
 
-    // 5. Search filter (case-insensitive name/description/sku)
+    // 5. Search (matches name, description, SKU, and variant SKUs)
     if (search) {
       where.OR = [
         { name: { contains: search, mode: "insensitive" } },
         { description: { contains: search, mode: "insensitive" } },
-        { sku: { contains: search, mode: "insensitive" } }
+        { sku: { contains: search, mode: "insensitive" } },
+        {
+          variants: {
+            some: {
+              sku: { contains: search, mode: "insensitive" }
+            }
+          }
+        }
       ];
     }
 
     // 6. Sorting Whitelist
-    let orderBy = { createdAt: "desc" }; // default 'newest'
+    let orderBy = { createdAt: "desc" };
     if (sort) {
       switch (sort) {
         case "price-asc":
@@ -109,7 +152,7 @@ export const getProducts = async (req, res, next) => {
 
     // 7. Pagination
     const pageNum = parseInt(page) || 1;
-    const limitNum = Math.min(parseInt(limit) || 12, 50); // Hard cap limit to 50
+    const limitNum = Math.min(parseInt(limit) || 12, 50);
     const skip = (pageNum - 1) * limitNum;
 
     // 8. Execute queries
@@ -130,12 +173,17 @@ export const getProducts = async (req, res, next) => {
               name: true,
               slug: true
             }
+          },
+          variants: {
+            where: { isActive: true }
+          },
+          reviews: {
+            where: { isApproved: true }
           }
         }
       })
     ]);
 
-    // 9. Format response (serialize Decimals to strings)
     const serializedProducts = products.map(serializeProduct);
 
     return res.status(200).json({
@@ -153,15 +201,20 @@ export const getProducts = async (req, res, next) => {
   }
 };
 
-// @desc    Get a single product by slug
-// @route   GET /api/products/:slug
+// @desc    Get a single product by slug or UUID ID
+// @route   GET /api/products/:slugOrId
 // @access  Public
 export const getProductBySlug = async (req, res, next) => {
   try {
-    const { slug } = req.params;
+    const { slugOrId } = req.params;
+
+    const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    const queryWhere = uuidRegex.test(slugOrId)
+      ? { id: slugOrId, isActive: true }
+      : { slug: slugOrId, isActive: true };
 
     const product = await prisma.product.findFirst({
-      where: { slug, isActive: true },
+      where: queryWhere,
       include: {
         images: {
           orderBy: { sortOrder: "asc" }
@@ -172,6 +225,12 @@ export const getProductBySlug = async (req, res, next) => {
             name: true,
             slug: true
           }
+        },
+        variants: {
+          where: { isActive: true }
+        },
+        reviews: {
+          where: { isApproved: true }
         }
       }
     });
@@ -192,7 +251,7 @@ export const getProductBySlug = async (req, res, next) => {
   }
 };
 
-// @desc    Get all products for Admin dashboard (includes inactive)
+// @desc    Get all products for Admin dashboard (includes inactive details)
 // @route   GET /api/admin/products
 // @access  Private/Admin
 export const getAdminProducts = async (req, res, next) => {
@@ -204,7 +263,14 @@ export const getAdminProducts = async (req, res, next) => {
       where.OR = [
         { name: { contains: search, mode: "insensitive" } },
         { description: { contains: search, mode: "insensitive" } },
-        { sku: { contains: search, mode: "insensitive" } }
+        { sku: { contains: search, mode: "insensitive" } },
+        {
+          variants: {
+            some: {
+              sku: { contains: search, mode: "insensitive" }
+            }
+          }
+        }
       ];
     }
 
@@ -229,7 +295,9 @@ export const getAdminProducts = async (req, res, next) => {
               name: true,
               slug: true
             }
-          }
+          },
+          variants: true,
+          reviews: true
         }
       })
     ]);
@@ -251,7 +319,7 @@ export const getAdminProducts = async (req, res, next) => {
   }
 };
 
-// @desc    Create a new product
+// @desc    Create a new product with variants
 // @route   POST /api/products
 // @access  Private/Admin
 export const createProduct = async (req, res, next) => {
@@ -262,12 +330,14 @@ export const createProduct = async (req, res, next) => {
       description,
       price,
       compareAtPrice,
-      stock,
       sku,
       categoryId,
       isActive,
       isFeatured,
-      isBestseller
+      isBestseller,
+      details,
+      careInstructions,
+      variants
     } = req.body;
 
     // 1. Required field validations
@@ -278,7 +348,7 @@ export const createProduct = async (req, res, next) => {
       });
     }
 
-    // 2. Numeric field validations
+    // 2. Price validation
     const numPrice = parseFloat(price);
     if (isNaN(numPrice) || numPrice < 0) {
       return res.status(400).json({
@@ -294,17 +364,6 @@ export const createProduct = async (req, res, next) => {
         return res.status(400).json({
           success: false,
           message: "compareAtPrice must be a positive number"
-        });
-      }
-    }
-
-    let numStock = 0;
-    if (stock !== undefined) {
-      numStock = parseInt(stock);
-      if (isNaN(numStock) || numStock < 0 || stock % 1 !== 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Stock must be a non-negative integer"
         });
       }
     }
@@ -329,9 +388,29 @@ export const createProduct = async (req, res, next) => {
       });
     }
 
+    // 4. Variant compilation (Default variant if empty)
+    let variantsList = [{ color: "Standard", stock: 0, isActive: true }];
+    if (variants && Array.isArray(variants) && variants.length > 0) {
+      variantsList = variants.map(v => {
+        const stockInt = parseInt(v.stock);
+        if (!v.color || isNaN(stockInt) || stockInt < 0 || v.stock % 1 !== 0) {
+          throw new Error("Each variant must have a valid color name and non-negative integer stock");
+        }
+        return {
+          color: v.color.trim(),
+          stock: stockInt,
+          sku: v.sku || null,
+          isActive: v.isActive !== undefined ? !!v.isActive : true
+        };
+      });
+    }
+
+    // Calculate aggregated stock count
+    const totalStock = variantsList.reduce((sum, v) => sum + v.stock, 0);
+
     const finalSlug = slug ? generateSlug(slug) : generateSlug(name);
 
-    // 4. Create Product using Whitelisted data
+    // 5. Create product and nested variants
     const product = await prisma.product.create({
       data: {
         name,
@@ -339,12 +418,17 @@ export const createProduct = async (req, res, next) => {
         description: description || null,
         price: numPrice,
         compareAtPrice: numComparePrice,
-        stock: numStock,
         sku: sku || null,
+        stock: totalStock, // aggregate stock
         categoryId,
         isActive: isActive !== undefined ? !!isActive : true,
-        isFeatured: isActive !== undefined ? !!isFeatured : false,
-        isBestseller: isActive !== undefined ? !!isBestseller : false
+        isFeatured: isFeatured !== undefined ? !!isFeatured : false,
+        isBestseller: isBestseller !== undefined ? !!isBestseller : false,
+        details: details || [],
+        careInstructions: careInstructions || null,
+        variants: {
+          create: variantsList
+        }
       },
       include: {
         category: {
@@ -354,7 +438,8 @@ export const createProduct = async (req, res, next) => {
             slug: true
           }
         },
-        images: true
+        images: true,
+        variants: true
       }
     });
 
@@ -363,17 +448,23 @@ export const createProduct = async (req, res, next) => {
       data: serializeProduct(product)
     });
   } catch (error) {
+    if (error.message.includes("Each variant must")) {
+      return res.status(400).json({
+        success: false,
+        message: error.message
+      });
+    }
     if (error.code === "P2002") {
       return res.status(409).json({
         success: false,
-        message: "Product slug or SKU already exists"
+        message: "Product slug, SKU or variant SKU already exists"
       });
     }
     next(error);
   }
 };
 
-// @desc    Update an existing product
+// @desc    Update product properties and sync variants list
 // @route   PATCH /api/products/:id
 // @access  Private/Admin
 export const updateProduct = async (req, res, next) => {
@@ -385,15 +476,16 @@ export const updateProduct = async (req, res, next) => {
       description,
       price,
       compareAtPrice,
-      stock,
       sku,
       categoryId,
       isActive,
       isFeatured,
-      isBestseller
+      isBestseller,
+      details,
+      careInstructions,
+      variants
     } = req.body;
 
-    // 1. UUID validation
     const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
     if (!uuidRegex.test(id)) {
       return res.status(400).json({
@@ -402,7 +494,6 @@ export const updateProduct = async (req, res, next) => {
       });
     }
 
-    // 2. Validate product exists
     const existingProduct = await prisma.product.findUnique({
       where: { id }
     });
@@ -414,7 +505,6 @@ export const updateProduct = async (req, res, next) => {
       });
     }
 
-    // 3. Build Whitelisted Update Object
     const updateData = {};
 
     if (name !== undefined) {
@@ -423,9 +513,7 @@ export const updateProduct = async (req, res, next) => {
         updateData.slug = generateSlug(name);
       }
     }
-    if (slug !== undefined) {
-      updateData.slug = generateSlug(slug);
-    }
+    if (slug !== undefined) updateData.slug = generateSlug(slug);
     if (description !== undefined) updateData.description = description;
 
     if (price !== undefined) {
@@ -454,17 +542,6 @@ export const updateProduct = async (req, res, next) => {
       }
     }
 
-    if (stock !== undefined) {
-      const numStock = parseInt(stock);
-      if (isNaN(numStock) || numStock < 0 || stock % 1 !== 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Stock must be a non-negative integer"
-        });
-      }
-      updateData.stock = numStock;
-    }
-
     if (sku !== undefined) updateData.sku = sku;
 
     if (categoryId !== undefined) {
@@ -489,8 +566,61 @@ export const updateProduct = async (req, res, next) => {
     if (isActive !== undefined) updateData.isActive = !!isActive;
     if (isFeatured !== undefined) updateData.isFeatured = !!isFeatured;
     if (isBestseller !== undefined) updateData.isBestseller = !!isBestseller;
+    if (details !== undefined) updateData.details = details;
+    if (careInstructions !== undefined) updateData.careInstructions = careInstructions;
 
-    // 4. Update in Database
+    // Synchronize variant child entities inside transactions if passed
+    if (variants !== undefined && Array.isArray(variants)) {
+      // 1. Delete omitted variants
+      const inputIds = variants.filter(v => v.id).map(v => v.id);
+      await prisma.productVariant.deleteMany({
+        where: {
+          productId: id,
+          id: { notIn: inputIds }
+        }
+      });
+
+      // 2. Create/Update remaining variants
+      for (const v of variants) {
+        const stockInt = parseInt(v.stock);
+        if (!v.color || isNaN(stockInt) || stockInt < 0 || v.stock % 1 !== 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Each variant must contain a valid color name and non-negative integer stock value"
+          });
+        }
+
+        if (v.id) {
+          await prisma.productVariant.update({
+            where: { id: v.id },
+            data: {
+              color: v.color.trim(),
+              stock: stockInt,
+              sku: v.sku || null,
+              isActive: v.isActive !== undefined ? !!v.isActive : true
+            }
+          });
+        } else {
+          await prisma.productVariant.create({
+            data: {
+              productId: id,
+              color: v.color.trim(),
+              stock: stockInt,
+              sku: v.sku || null,
+              isActive: v.isActive !== undefined ? !!v.isActive : true
+            }
+          });
+        }
+      }
+    }
+
+    // Load final variants to calculate the updated aggregate stock count
+    const activeVariants = await prisma.productVariant.findMany({
+      where: { productId: id, isActive: true }
+    });
+    updateData.stock = activeVariants.reduce((sum, v) => sum + v.stock, 0);
+
+    // Save product update
     const updatedProduct = await prisma.product.update({
       where: { id },
       data: updateData,
@@ -502,7 +632,8 @@ export const updateProduct = async (req, res, next) => {
             slug: true
           }
         },
-        images: true
+        images: true,
+        variants: true
       }
     });
 
@@ -514,14 +645,14 @@ export const updateProduct = async (req, res, next) => {
     if (error.code === "P2002") {
       return res.status(409).json({
         success: false,
-        message: "Product slug or SKU already exists"
+        message: "Product slug, SKU or variant SKU already exists"
       });
     }
     next(error);
   }
 };
 
-// @desc    Deactivate/Activate a product status
+// @desc    Toggle product activation status
 // @route   PATCH /api/products/:id/status
 // @access  Private/Admin
 export const updateProductStatus = async (req, res, next) => {
@@ -529,7 +660,6 @@ export const updateProductStatus = async (req, res, next) => {
     const { id } = req.params;
     const { isActive } = req.body;
 
-    // 1. UUID validation
     const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
     if (!uuidRegex.test(id)) {
       return res.status(400).json({
@@ -538,7 +668,6 @@ export const updateProductStatus = async (req, res, next) => {
       });
     }
 
-    // 2. Validate input is boolean
     if (isActive === undefined || typeof isActive !== "boolean") {
       return res.status(400).json({
         success: false,
@@ -546,7 +675,6 @@ export const updateProductStatus = async (req, res, next) => {
       });
     }
 
-    // 3. Verify product exists
     const existingProduct = await prisma.product.findUnique({
       where: { id }
     });
@@ -558,7 +686,6 @@ export const updateProductStatus = async (req, res, next) => {
       });
     }
 
-    // 4. Update status
     const updatedProduct = await prisma.product.update({
       where: { id },
       data: { isActive },
@@ -570,7 +697,8 @@ export const updateProductStatus = async (req, res, next) => {
             slug: true
           }
         },
-        images: true
+        images: true,
+        variants: true
       }
     });
 
@@ -583,24 +711,22 @@ export const updateProductStatus = async (req, res, next) => {
   }
 };
 
-// @desc    Update product inventory stock level
+// @desc    Update a specific variant stock level
 // @route   PATCH /api/products/:id/stock
 // @access  Private/Admin
 export const updateProductStock = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const { stock } = req.body;
+    const { id } = req.params; // Product ID
+    const { variantId, stock } = req.body;
 
-    // 1. UUID validation
     const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-    if (!uuidRegex.test(id)) {
+    if (!uuidRegex.test(id) || !uuidRegex.test(variantId)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid product ID format"
+        message: "Invalid product ID or variant ID format"
       });
     }
 
-    // 2. Validate input is integer >= 0
     const numStock = parseInt(stock);
     if (stock === undefined || isNaN(numStock) || numStock < 0 || stock % 1 !== 0) {
       return res.status(400).json({
@@ -609,22 +735,34 @@ export const updateProductStock = async (req, res, next) => {
       });
     }
 
-    // 3. Verify product exists
-    const existingProduct = await prisma.product.findUnique({
-      where: { id }
+    // Verify product variant exists and links to this product
+    const variant = await prisma.productVariant.findFirst({
+      where: { id: variantId, productId: id }
     });
 
-    if (!existingProduct) {
+    if (!variant) {
       return res.status(404).json({
         success: false,
-        message: "Product not found"
+        message: "Product variant not found"
       });
     }
 
-    // 4. Update stock
+    // Update variant stock
+    await prisma.productVariant.update({
+      where: { id: variantId },
+      data: { stock: numStock }
+    });
+
+    // Load active variants to recalculate the aggregate product stock
+    const activeVariants = await prisma.productVariant.findMany({
+      where: { productId: id, isActive: true }
+    });
+    const totalStock = activeVariants.reduce((sum, v) => sum + v.stock, 0);
+
+    // Save aggregated count
     const updatedProduct = await prisma.product.update({
       where: { id },
-      data: { stock: numStock },
+      data: { stock: totalStock },
       include: {
         category: {
           select: {
@@ -633,7 +771,8 @@ export const updateProductStock = async (req, res, next) => {
             slug: true
           }
         },
-        images: true
+        images: true,
+        variants: true
       }
     });
 

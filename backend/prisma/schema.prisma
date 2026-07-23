@@ -104,15 +104,32 @@ model Product {
   isActive       Boolean              @default(true)
   isFeatured     Boolean              @default(false)
   isBestseller   Boolean              @default(false)
+  details        String[]             @default([])
+  careInstructions String?
   createdAt      DateTime             @default(now())
   updatedAt      DateTime             @updatedAt
   images         ProductImage[]
   orderItems     OrderItem[]
   reviews        Review[]
   interactions   ProductInteraction[]
+  variants       ProductVariant[]
 
   @@index([slug])
   @@index([categoryId])
+}
+
+model ProductVariant {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  color     String
+  sku       String?  @unique
+  stock     Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([productId])
 }
 
 model ProductImage {
@@ -155,6 +172,7 @@ model OrderItem {
   productId   String?
   product     Product? @relation(fields: [productId], references: [id], onDelete: Restrict)
   productName String
+  color       String?
   quantity    Int
   unitPrice   Decimal  @db.Decimal(10, 2)
   totalPrice  Decimal  @db.Decimal(10, 2)
